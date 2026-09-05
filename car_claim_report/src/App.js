@@ -422,7 +422,6 @@ export default function App() {
 
   useEffect(() => {
     if (claimId) refreshSignStatus(claimId);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [claimId]);
 
   // 9. 按「開始簽署」前先檢查目前選的文件類型是不是已經簽過了，簽過要再次確認才會真的打開簽署畫面
@@ -683,7 +682,6 @@ export default function App() {
     if (estimatedClaimAmount !== "" || hasAnyInjury) {
       runComplexityTriage();
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [estimatedClaimAmount, hasAnyInjury]);
 
   // ================================================================
