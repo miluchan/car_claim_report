@@ -1513,9 +1513,8 @@ export default function App() {
             <div className="small text-muted">拍攝內容已送出，理賠人員將會協助後續處理，您可以關閉此頁面。</div>
           </div>
         )}
+        {customCameraModal}
       </div>
-      {customCameraModal}
-    </div>
     );
   }
 
@@ -2642,4 +2641,5 @@ export default function App() {
     </div>
   );
 }
+
 
