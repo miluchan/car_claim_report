@@ -606,9 +606,18 @@ export default function App() {
 
   // 3. 讀取檔案並轉成base64直接存進資料庫（不依賴任何本地暫存網址或外部雲端服務）；
   // 圖片類型會先縮小到最長邊不超過1600px、轉JPEG壓縮，避免檔案太大存不進去或上傳太久
+  // 判斷是不是圖片：不能只看 file.type——手機「選擇檔案」(不是從相簿選) 有時候回傳的
+  // file.type 是空字串，導致原本判斷失準、把明明是照片的檔案當成「非圖片」處理，
+  // 存起來之後調閱只看得到檔名、看不到照片內容。改成type判斷失敗時，改用副檔名補判斷。
+  const looksLikeImage = (file) => {
+    if (file.type && file.type.startsWith("image/")) return true;
+    if (file.type) return false; // 有明確type但不是image/開頭（例如pdf），就真的不是圖片
+    return /\.(jpe?g|png|gif|webp|bmp|heic|heif)$/i.test(file.name || "");
+  };
+
   const fileToCompressedDataUrl = (file) => {
     return new Promise((resolve, reject) => {
-      if (!file.type || !file.type.startsWith("image/")) {
+      if (!looksLikeImage(file)) {
         const reader = new FileReader();
         reader.onload = () => resolve({ dataUrl: reader.result, mimeType: file.type || "application/octet-stream" });
         reader.onerror = reject;
@@ -632,7 +641,12 @@ export default function App() {
           canvas.getContext("2d").drawImage(img, 0, 0, width, height);
           resolve({ dataUrl: canvas.toDataURL("image/jpeg", 0.82), mimeType: "image/jpeg" });
         };
-        img.onerror = reject;
+        img.onerror = () => {
+          // 瀏覽器不支援直接解碼這個圖片格式（常見於iPhone的HEIC原始格式）——
+          // 不要整個失敗讓照片存不進去，退而求其次直接存原始檔案內容，
+          // 之後如果瀏覽器不能直接預覽，至少檔案本身是保留住的，不會憑空消失
+          resolve({ dataUrl: reader.result, mimeType: file.type || "image/heic" });
+        };
         img.src = reader.result;
       };
       reader.onerror = reject;
@@ -678,20 +692,28 @@ export default function App() {
   };
 
   // 3. 統一的文件預覽：圖片直接顯示縮圖、影片可播放，其餘類型才退回下載連結
-  const renderDocPreview = (d, i) => (
-    <div key={d.id || i} className="border rounded p-2 mb-2">
-      {d.fileType && d.fileType.startsWith("image/") ? (
-        <img src={d.fileUrl} alt={d.fileName} className="img-fluid rounded mb-1" style={{ maxHeight: 220, objectFit: "contain", width: "100%" }} />
-      ) : d.fileType && d.fileType.startsWith("video/") ? (
-        <video src={d.fileUrl} controls className="w-100 rounded mb-1" style={{ maxHeight: 220 }} />
-      ) : (
-        <a href={d.fileUrl} download={d.fileName} className="d-block text-decoration-none">
-          📎 {d.fileName}
-        </a>
-      )}
-      <div className="small text-muted">{d.fileName}</div>
-    </div>
-  );
+  const renderDocPreview = (d, i) => {
+    const isHeic = d.fileType && /heic|heif/i.test(d.fileType);
+    return (
+      <div key={d.id || i} className="border rounded p-2 mb-2">
+        {isHeic ? (
+          <div className="alert alert-warning small mb-1 py-2">
+            ⚠️ 此為iPhone原始HEIC格式照片，瀏覽器可能無法直接預覽，但檔案內容已完整保留，
+            <a href={d.fileUrl} download={d.fileName}>點此下載查看</a>。
+          </div>
+        ) : d.fileType && d.fileType.startsWith("image/") ? (
+          <img src={d.fileUrl} alt={d.fileName} className="img-fluid rounded mb-1" style={{ maxHeight: 220, objectFit: "contain", width: "100%" }} />
+        ) : d.fileType && d.fileType.startsWith("video/") ? (
+          <video src={d.fileUrl} controls className="w-100 rounded mb-1" style={{ maxHeight: 220 }} />
+        ) : (
+          <a href={d.fileUrl} download={d.fileName} className="d-block text-decoration-none">
+            📎 {d.fileName}
+          </a>
+        )}
+        <div className="small text-muted">{d.fileName}</div>
+      </div>
+    );
+  };
 
   const handleUploadDocument = async (file, category, setList) => {
     if (!file) return;
@@ -1958,17 +1980,26 @@ export default function App() {
         </button>
       </div>
       <div className="row g-2 mb-3">
-        <div className="col-4">
+        <div className="col-3">
           <button type="button" className="btn btn-primary w-100" onClick={() => setShowRepairUploadModal(true)}>
             📤 上傳文件 ({repairDocuments.length})
           </button>
         </div>
-        <div className="col-4">
+        <div className="col-3">
+          <button
+            type="button"
+            className="btn btn-success w-100"
+            onClick={() => openCustomCamera("repair_estimate", setRepairDocuments)}
+          >
+            📸 即拍即傳
+          </button>
+        </div>
+        <div className="col-3">
           <button type="button" className="btn btn-outline-dark w-100" onClick={() => setShowRepairViewModal(true)}>
             🔍 上傳文件調閱
           </button>
         </div>
-        <div className="col-4">
+        <div className="col-3">
           <button type="button" className="btn btn-outline-primary w-100" onClick={() => setShowRepairAiModal(true)}>
             🤖 AI文件辨識
           </button>
@@ -2224,6 +2255,9 @@ export default function App() {
                 <h6 className="fw-bold text-primary mb-0">📤 上傳事故處理文件</h6>
                 <button type="button" className="btn-close" onClick={() => setShowAccidentUploadModal(false)} />
               </div>
+              <div className="alert alert-info small py-2 mb-2">
+                💡 這裡適合上傳<strong>已經拍好、存在手機裡的</strong>照片或檔案。若要現場直接拍照／錄影，建議改用「即拍即傳」按鈕，體驗更穩定。
+              </div>
               <label
                 onDragOver={(e) => { e.preventDefault(); setIsDraggingAccidentFile(true); }}
                 onDragLeave={() => setIsDraggingAccidentFile(false)}
@@ -2249,11 +2283,9 @@ export default function App() {
                 />
               </label>
               {accidentDocuments.length > 0 && (
-                <div className="mt-3 small">
-                  <div className="fw-bold mb-1">已上傳 {accidentDocuments.length} 筆：</div>
-                  {accidentDocuments.map((d, i) => (
-                    <div key={i} className="text-muted">📎 {d.fileName}</div>
-                  ))}
+                <div className="mt-3">
+                  <div className="fw-bold small mb-1">已上傳 {accidentDocuments.length} 筆：</div>
+                  {accidentDocuments.map(renderDocPreview)}
                 </div>
               )}
             </div>
@@ -2343,6 +2375,9 @@ export default function App() {
                 <h6 className="fw-bold text-primary mb-0">📤 上傳修車估價文件</h6>
                 <button type="button" className="btn-close" onClick={() => setShowRepairUploadModal(false)} />
               </div>
+              <div className="alert alert-info small py-2 mb-2">
+                💡 這裡適合上傳<strong>已經拍好、存在手機裡的</strong>照片或檔案。若要現場直接拍照／錄影，建議改用「即拍即傳」按鈕，體驗更穩定。
+              </div>
               <label
                 onDragOver={(e) => { e.preventDefault(); setIsDraggingRepairFile(true); }}
                 onDragLeave={() => setIsDraggingRepairFile(false)}
@@ -2368,11 +2403,9 @@ export default function App() {
                 />
               </label>
               {repairDocuments.length > 0 && (
-                <div className="mt-3 small">
-                  <div className="fw-bold mb-1">已上傳 {repairDocuments.length} 筆：</div>
-                  {repairDocuments.map((d, i) => (
-                    <div key={i} className="text-muted">📎 {d.fileName}</div>
-                  ))}
+                <div className="mt-3">
+                  <div className="fw-bold small mb-1">已上傳 {repairDocuments.length} 筆：</div>
+                  {repairDocuments.map(renderDocPreview)}
                 </div>
               )}
             </div>
@@ -2641,5 +2674,6 @@ export default function App() {
     </div>
   );
 }
+
 
 
