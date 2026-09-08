@@ -113,7 +113,7 @@ export default function App() {
     const mapDoc = (r) => ({
       id: r.id,
       fileName: r.file_name,
-      fileUrl: r.file_url,
+      fileUrl: r.file_data || r.file_url, // 3. 優先用真正存進資料庫的檔案內容，舊資料若只有file_url則still可退回顯示
       fileType: r.file_type,
       category: r.document_category,
       uploadedAt: r.uploaded_at,
@@ -405,15 +405,132 @@ export default function App() {
     setAiGuideStep((s) => Math.max(s - 1, 0));
     setAiGuideStepPhotoCount(0);
   };
-  // 5. 點框直接開相機拍照，可連續拍多張，直到按下一步才往下走
-  const handleAiGuideCapture = async (e) => {
-    const files = e.target.files;
-    if (!files || files.length === 0) return;
-    for (let i = 0; i < files.length; i++) {
-      await handleUploadDocument(files[i], "accident_evidence", setAccidentDocuments);
+  // 4／5. 自製相機介面（取代原生相機App）：拍一張立刻存一張，不會因為中途取消而全部消失；
+  // 同時支援錄影。畫面上的按鈕文字/行為完全由我們自己控制，不再依賴手機作業系統的相機介面。
+  const [showCustomCamera, setShowCustomCamera] = useState(false);
+  const [cameraCategory, setCameraCategory] = useState("accident_evidence");
+  const [cameraTargetClaimId, setCameraTargetClaimId] = useState(null); // 客戶端遠端拍照時，用網址帶進來的claim_id
+  const cameraSetListRef = useRef(null);
+  const [cameraStream, setCameraStream] = useState(null);
+  const [cameraError, setCameraError] = useState("");
+  const [isRecordingVideo, setIsRecordingVideo] = useState(false);
+  const [cameraShotCount, setCameraShotCount] = useState(0);
+  const [recordSeconds, setRecordSeconds] = useState(0);
+  const videoElRef = useRef(null);
+  const mediaRecorderRef = useRef(null);
+  const recordedChunksRef = useRef([]);
+  const recordTimerRef = useRef(null);
+  const MAX_RECORD_SECONDS = 15; // 控制影片大小，避免base64編碼後太大上傳失敗
+
+  const openCustomCamera = async (category, setList, targetClaimId) => {
+    setCameraCategory(category);
+    cameraSetListRef.current = setList || null;
+    setCameraTargetClaimId(targetClaimId || null);
+    setCameraShotCount(0);
+    setCameraError("");
+    setShowCustomCamera(true);
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" }, audio: true });
+      setCameraStream(stream);
+    } catch (e) {
+      setCameraError("⚠️ 無法開啟相機，請確認已授權相機／麥克風權限，且此網站為https連線。");
     }
-    setAiGuideStepPhotoCount((c) => c + files.length);
-    e.target.value = "";
+  };
+
+  const closeCustomCamera = () => {
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+      try {
+        mediaRecorderRef.current.stop();
+      } catch (e) {}
+    }
+    if (cameraStream) {
+      cameraStream.getTracks().forEach((t) => t.stop());
+    }
+    if (recordTimerRef.current) {
+      clearInterval(recordTimerRef.current);
+      recordTimerRef.current = null;
+    }
+    setCameraStream(null);
+    setShowCustomCamera(false);
+    setIsRecordingVideo(false);
+    setRecordSeconds(0);
+  };
+
+  useEffect(() => {
+    if (cameraStream && videoElRef.current) {
+      videoElRef.current.srcObject = cameraStream;
+    }
+  }, [cameraStream]);
+
+  const takePhoto = async () => {
+    const video = videoElRef.current;
+    if (!video || !video.videoWidth) return;
+    const canvas = document.createElement("canvas");
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    canvas.getContext("2d").drawImage(video, 0, 0);
+    const dataUrl = canvas.toDataURL("image/jpeg", 0.82);
+    const fileName = "photo_" + Date.now() + ".jpg";
+    const doc = await persistCapturedFile(
+      dataUrl, "image/jpeg", fileName, cameraCategory, cameraSetListRef.current, cameraTargetClaimId
+    );
+    if (doc) {
+      setCameraShotCount((c) => c + 1);
+      if (showAiGuideModal) setAiGuideStepPhotoCount((c) => c + 1);
+    }
+  };
+
+  const startRecording = () => {
+    if (!cameraStream) return;
+    recordedChunksRef.current = [];
+    let recorder;
+    try {
+      recorder = new MediaRecorder(cameraStream, { mimeType: "video/webm" });
+    } catch (e) {
+      recorder = new MediaRecorder(cameraStream);
+    }
+    recorder.ondataavailable = (e) => {
+      if (e.data && e.data.size > 0) recordedChunksRef.current.push(e.data);
+    };
+    recorder.onstop = async () => {
+      const blob = new Blob(recordedChunksRef.current, { type: "video/webm" });
+      const reader = new FileReader();
+      reader.onload = async () => {
+        const fileName = "video_" + Date.now() + ".webm";
+        const doc = await persistCapturedFile(
+          reader.result, "video/webm", fileName, cameraCategory, cameraSetListRef.current, cameraTargetClaimId
+        );
+        if (doc) {
+          setCameraShotCount((c) => c + 1);
+          if (showAiGuideModal) setAiGuideStepPhotoCount((c) => c + 1);
+        }
+      };
+      reader.readAsDataURL(blob);
+    };
+    recorder.start();
+    mediaRecorderRef.current = recorder;
+    setIsRecordingVideo(true);
+    setRecordSeconds(0);
+    recordTimerRef.current = setInterval(() => {
+      setRecordSeconds((s) => {
+        if (s + 1 >= MAX_RECORD_SECONDS) {
+          stopRecording();
+          return MAX_RECORD_SECONDS;
+        }
+        return s + 1;
+      });
+    }, 1000);
+  };
+
+  const stopRecording = () => {
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+      mediaRecorderRef.current.stop();
+    }
+    if (recordTimerRef.current) {
+      clearInterval(recordTimerRef.current);
+      recordTimerRef.current = null;
+    }
+    setIsRecordingVideo(false);
   };
 
   // 6. 報案人電話 ＋ 簡訊通知（連結帶到customer自助拍照畫面，跟AI引導處理一樣）
@@ -487,48 +604,106 @@ export default function App() {
   const [isDraggingAccidentFile, setIsDraggingAccidentFile] = useState(false);
   const [aiPickedAccidentDoc, setAiPickedAccidentDoc] = useState(null);
 
-  const handleUploadDocument = async (file, category, setList) => {
-    if (!file) return;
-    if (!claimId) {
-      alert("⚠️ 請先按下方「儲存立案資料」建立案件，才能上傳文件。");
-      return;
+  // 3. 讀取檔案並轉成base64直接存進資料庫（不依賴任何本地暫存網址或外部雲端服務）；
+  // 圖片類型會先縮小到最長邊不超過1600px、轉JPEG壓縮，避免檔案太大存不進去或上傳太久
+  const fileToCompressedDataUrl = (file) => {
+    return new Promise((resolve, reject) => {
+      if (!file.type || !file.type.startsWith("image/")) {
+        const reader = new FileReader();
+        reader.onload = () => resolve({ dataUrl: reader.result, mimeType: file.type || "application/octet-stream" });
+        reader.onerror = reject;
+        reader.readAsDataURL(file);
+        return;
+      }
+      const img = new Image();
+      const reader = new FileReader();
+      reader.onload = () => {
+        img.onload = () => {
+          const maxDim = 1600;
+          let { width, height } = img;
+          if (width > maxDim || height > maxDim) {
+            const scale = maxDim / Math.max(width, height);
+            width = Math.round(width * scale);
+            height = Math.round(height * scale);
+          }
+          const canvas = document.createElement("canvas");
+          canvas.width = width;
+          canvas.height = height;
+          canvas.getContext("2d").drawImage(img, 0, 0, width, height);
+          resolve({ dataUrl: canvas.toDataURL("image/jpeg", 0.82), mimeType: "image/jpeg" });
+        };
+        img.onerror = reject;
+        img.src = reader.result;
+      };
+      reader.onerror = reject;
+      reader.readAsDataURL(file);
+    });
+  };
+
+  // 真正寫進資料庫的共用函式：檔案挑選上傳、自製相機拍照、錄影，最後都走這裡，確保行為一致
+  const persistCapturedFile = async (dataUrl, mimeType, fileName, category, setList, targetClaimId) => {
+    const cid = targetClaimId || claimId;
+    if (!cid) {
+      alert("⚠️ 請先受理／儲存立案資料，才能上傳文件。");
+      return null;
     }
-    // 🧪 檔案本體先用本地暫存網址模擬（之後接 Supabase Storage 時，這裡改成真的上傳並取得正式file_url），
-    // 但檔案的「紀錄」（誰上傳了什麼檔案）10. 現在會確實寫進 claim_documents，不再只是停留在畫面上
-    const fakeUrl = URL.createObjectURL(file);
     const uploadedAt = new Date().toISOString();
     try {
       const { data, error } = await supabaseClient
         .from("claim_documents")
         .insert([
           {
-            claim_id: claimId,
+            claim_id: cid,
             document_category: category,
-            file_name: file.name,
-            file_url: fakeUrl,
-            file_type: file.type,
+            file_name: fileName,
+            file_url: null,
+            file_data: dataUrl,
+            file_type: mimeType,
             uploaded_at: uploadedAt,
           },
         ])
         .select()
         .single();
       if (error) {
-        alert("⚠️ 文件紀錄寫入失敗：" + error.message);
-        return;
+        alert("⚠️ 文件儲存失敗：" + error.message + "（若是影片，可能是檔案過大，請縮短錄影長度後再試）");
+        return null;
       }
-      setList((prev) => [
-        ...prev,
-        {
-          id: data.id,
-          fileName: file.name,
-          fileUrl: fakeUrl,
-          fileType: file.type,
-          category,
-          uploadedAt,
-        },
-      ]);
+      const doc = { id: data.id, fileName, fileUrl: dataUrl, fileType: mimeType, category, uploadedAt };
+      if (setList) setList((prev) => [...prev, doc]);
+      return doc;
     } catch (e) {
       alert("⚠️ 文件上傳過程發生未預期錯誤。");
+      return null;
+    }
+  };
+
+  // 3. 統一的文件預覽：圖片直接顯示縮圖、影片可播放，其餘類型才退回下載連結
+  const renderDocPreview = (d, i) => (
+    <div key={d.id || i} className="border rounded p-2 mb-2">
+      {d.fileType && d.fileType.startsWith("image/") ? (
+        <img src={d.fileUrl} alt={d.fileName} className="img-fluid rounded mb-1" style={{ maxHeight: 220, objectFit: "contain", width: "100%" }} />
+      ) : d.fileType && d.fileType.startsWith("video/") ? (
+        <video src={d.fileUrl} controls className="w-100 rounded mb-1" style={{ maxHeight: 220 }} />
+      ) : (
+        <a href={d.fileUrl} download={d.fileName} className="d-block text-decoration-none">
+          📎 {d.fileName}
+        </a>
+      )}
+      <div className="small text-muted">{d.fileName}</div>
+    </div>
+  );
+
+  const handleUploadDocument = async (file, category, setList) => {
+    if (!file) return;
+    if (!claimId) {
+      alert("⚠️ 請先按下方「儲存立案資料」建立案件，才能上傳文件。");
+      return;
+    }
+    try {
+      const { dataUrl, mimeType } = await fileToCompressedDataUrl(file);
+      await persistCapturedFile(dataUrl, mimeType, file.name, category, setList);
+    } catch (e) {
+      alert("⚠️ 檔案讀取失敗，請重新選擇檔案。");
     }
   };
 
@@ -1092,11 +1267,83 @@ export default function App() {
       }
 
       alert("✅ 立案資料已儲存！立案編號：" + claimNo);
+      resetClaimForm(); // 2. 儲存後清空畫面；要繼續處理同一筆案件時，用「受理與查詢報案」重新查詢即可帶回進度
     } catch (e) {
       alert("⚠️ 儲存過程發生未預期錯誤。");
     }
     setSaving(false);
   };
+
+  // 4／5. 自製相機介面的畫面本體，計算一次供「內部主畫面」跟「客戶自助頁」共用
+  const customCameraModal = showCustomCamera ? (
+    <div className="modal d-block show" style={{ position: "fixed", top: 0, left: 0, width: "100%", height: "100%", zIndex: 100095, background: "#000" }}>
+      <div className="d-flex flex-column" style={{ height: "100%" }}>
+        <div className="d-flex justify-content-between align-items-center p-2" style={{ background: "#111" }}>
+          <span className="text-white small">
+            📷 拍照／錄影{cameraShotCount > 0 ? `（已存 ${cameraShotCount} 筆）` : ""}
+          </span>
+          <button type="button" className="btn btn-sm btn-light fw-bold" onClick={closeCustomCamera}>
+            完成
+          </button>
+        </div>
+        {cameraError ? (
+          <div className="flex-fill d-flex align-items-center justify-content-center text-white p-4 text-center">
+            {cameraError}
+          </div>
+        ) : (
+          <>
+            <div className="flex-fill position-relative" style={{ background: "#000", minHeight: 0 }}>
+              <video
+                ref={videoElRef}
+                autoPlay
+                playsInline
+                className="w-100 h-100"
+                style={{ objectFit: "contain" }}
+              />
+              {isRecordingVideo && (
+                <span className="position-absolute top-0 start-0 m-3 badge bg-danger">
+                  🔴 錄影中 {recordSeconds}s / {MAX_RECORD_SECONDS}s
+                </span>
+              )}
+            </div>
+            <div className="d-flex justify-content-center align-items-center gap-4 p-3" style={{ background: "#111" }}>
+              <button
+                type="button"
+                className="btn btn-light rounded-circle d-flex align-items-center justify-content-center fs-4"
+                style={{ width: 64, height: 64 }}
+                onClick={takePhoto}
+                disabled={isRecordingVideo}
+                title="拍照"
+              >
+                📷
+              </button>
+              {!isRecordingVideo ? (
+                <button
+                  type="button"
+                  className="btn btn-danger rounded-circle d-flex align-items-center justify-content-center fs-4"
+                  style={{ width: 64, height: 64 }}
+                  onClick={startRecording}
+                  title="開始錄影"
+                >
+                  🎥
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  className="btn btn-warning rounded-circle d-flex align-items-center justify-content-center fs-4"
+                  style={{ width: 64, height: 64 }}
+                  onClick={stopRecording}
+                  title="停止錄影"
+                >
+                  ⏹
+                </button>
+              )}
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  ) : null;
 
   // 4. 客戶遠端簽署畫面：簡訊/LINE連結帶 ?signClaimId=&signDocType= 進來，只顯示簽署流程
   const urlParams = new URLSearchParams(window.location.search);
@@ -1231,43 +1478,21 @@ export default function App() {
         <h5 className="fw-bold text-center text-primary mb-4">🤖 事故現場拍照引導</h5>
         {aiGuideStep < AI_GUIDE_SCENE_STEPS.length ? (
           <>
-            <div className="d-flex justify-content-between align-items-center mb-2 small text-muted">
-              <span>拍攝步驟 {aiGuideStep + 1} / {AI_GUIDE_SCENE_STEPS.length}</span>
+            <div className="mb-1 small text-muted">
+              拍攝步驟 {aiGuideStep + 1} / {AI_GUIDE_SCENE_STEPS.length}　請依指示完成八個步驟的拍攝
             </div>
             <div className="bg-primary bg-opacity-10 border border-primary rounded p-3 text-center mb-2">
               <div className="fw-bold fs-5 mb-2">請拍攝：{AI_GUIDE_SCENE_STEPS[aiGuideStep]}</div>
-              <label className="d-block border border-primary rounded p-4 mb-0 bg-white" style={{ borderStyle: "dashed", cursor: "pointer" }}>
+              <button
+                type="button"
+                className="btn btn-outline-primary w-100 py-4"
+                style={{ borderStyle: "dashed" }}
+                onClick={() => openCustomCamera("accident_evidence", null, parseInt(guideClaimIdParam, 10))}
+              >
                 <div className="fs-1 mb-2">📷</div>
-                <div className="fw-bold">點此開啟相機拍攝</div>
+                <div className="fw-bold">點此開啟相機（可拍照或錄影）</div>
                 <div className="small text-muted">可連續拍攝多張，拍好後按下一步</div>
-                <input
-                  type="file"
-                  accept="image/*"
-                  capture="environment"
-                  multiple
-                  className="d-none"
-                  onChange={async (e) => {
-                    const files = e.target.files;
-                    if (!files || files.length === 0) return;
-                    for (let i = 0; i < files.length; i++) {
-                      const file = files[i];
-                      const fakeUrl = URL.createObjectURL(file);
-                      await supabaseClient.from("claim_documents").insert([
-                        {
-                          claim_id: parseInt(guideClaimIdParam, 10),
-                          document_category: "accident_evidence",
-                          file_name: file.name,
-                          file_url: fakeUrl,
-                          file_type: file.type,
-                          uploaded_at: new Date().toISOString(),
-                        },
-                      ]);
-                    }
-                    setAiGuideStepPhotoCount((c) => c + files.length);
-                    e.target.value = "";
-                  }}
-                />
-              </label>
+              </button>
               {aiGuideStepPhotoCount > 0 && (
                 <div className="small text-success fw-bold mt-2">✅ 這個步驟已拍攝 {aiGuideStepPhotoCount} 張</div>
               )}
@@ -1289,8 +1514,11 @@ export default function App() {
           </div>
         )}
       </div>
+      {customCameraModal}
+    </div>
     );
   }
+
 
   return (
     <div className="container py-4" style={{ maxWidth: "980px" }}>
@@ -1552,17 +1780,17 @@ export default function App() {
       )}
 
       {/* ==================== 1. 被保險人區塊 ==================== */}
-      <h6 className="fw-bold text-dark mb-2">👤 被保險人</h6>
+      <h6 className="fw-bold text-dark mb-2">👤 被保險人 <span className="badge bg-secondary fw-normal">投保資料快照，不可修改</span></h6>
       <div className="row g-3 bg-light p-3 rounded mb-4 border">
         <div className="col-6 col-md-4">保單號碼<input type="text" className="form-control bg-white" value={quotationNo} readOnly /></div>
-        <div className="col-6 col-md-4">姓名<input type="text" className="form-control bg-white" value={insuredName} onChange={(e) => setInsuredName(e.target.value)} /></div>
-        <div className="col-6 col-md-4">性別<input type="text" className="form-control bg-white" value={insuredGender} onChange={(e) => setInsuredGender(e.target.value)} /></div>
-        <div className="col-6 col-md-4">電話<input type="text" className="form-control bg-white" value={insuredPhone} onChange={(e) => setInsuredPhone(e.target.value)} /></div>
-        <div className="col-6 col-md-4">ID<input type="text" className="form-control bg-white" value={insuredIdNumber} onChange={(e) => setInsuredIdNumber(e.target.value)} /></div>
-        <div className="col-12 col-md-8">地址<input type="text" className="form-control bg-white" value={insuredAddress} onChange={(e) => setInsuredAddress(e.target.value)} /></div>
-        <div className="col-6 col-md-4">車種<input type="text" className="form-control bg-white" value={vehicleType} onChange={(e) => setVehicleType(e.target.value)} /></div>
-        <div className="col-6 col-md-4">廠牌車系<input type="text" className="form-control bg-white" value={brandSeries} onChange={(e) => setBrandSeries(e.target.value)} /></div>
-        <div className="col-12 col-md-4">E-mail<input type="text" className="form-control bg-white" value={insuredEmail} onChange={(e) => setInsuredEmail(e.target.value)} /></div>
+        <div className="col-6 col-md-4">姓名<input type="text" className="form-control bg-white" value={insuredName} readOnly /></div>
+        <div className="col-6 col-md-4">性別<input type="text" className="form-control bg-white" value={insuredGender} readOnly /></div>
+        <div className="col-6 col-md-4">電話<input type="text" className="form-control bg-white" value={insuredPhone} readOnly /></div>
+        <div className="col-6 col-md-4">ID<input type="text" className="form-control bg-white" value={insuredIdNumber} readOnly /></div>
+        <div className="col-12 col-md-8">地址<input type="text" className="form-control bg-white" value={insuredAddress} readOnly /></div>
+        <div className="col-6 col-md-4">車種<input type="text" className="form-control bg-white" value={vehicleType} readOnly /></div>
+        <div className="col-6 col-md-4">廠牌車系<input type="text" className="form-control bg-white" value={brandSeries} readOnly /></div>
+        <div className="col-12 col-md-4">E-mail<input type="text" className="form-control bg-white" value={insuredEmail} readOnly /></div>
       </div>
 
       {/* ==================== 2. 駕駛人區塊 ==================== */}
@@ -1667,24 +1895,13 @@ export default function App() {
           </button>
         </div>
         <div className="col-3">
-          <label className="btn btn-success w-100 mb-0">
+          <button
+            type="button"
+            className="btn btn-success w-100"
+            onClick={() => openCustomCamera("accident_evidence", setAccidentDocuments)}
+          >
             📸 即拍即傳
-            <input
-              type="file"
-              accept="image/*"
-              capture="environment"
-              multiple
-              className="d-none"
-              onChange={async (e) => {
-                const files = e.target.files;
-                if (!files || files.length === 0) return;
-                for (let i = 0; i < files.length; i++) {
-                  await handleUploadDocument(files[i], "accident_evidence", setAccidentDocuments);
-                }
-                e.target.value = "";
-              }}
-            />
-          </label>
+          </button>
         </div>
         <div className="col-3">
           <button type="button" className="btn btn-outline-dark w-100" onClick={() => setShowAccidentViewModal(true)}>
@@ -1933,42 +2150,32 @@ export default function App() {
 
               {aiGuideStep < AI_GUIDE_SCENE_STEPS.length ? (
                 <>
-                  <div className="d-flex justify-content-between align-items-center mb-2 small text-muted">
-                    <span>拍攝步驟 {aiGuideStep + 1} / {AI_GUIDE_SCENE_STEPS.length}</span>
+                  <div className="mb-2 small text-muted">
+                    拍攝步驟 {aiGuideStep + 1} / {AI_GUIDE_SCENE_STEPS.length}　請依指示完成八個步驟的拍攝
                   </div>
                   <div className="bg-primary bg-opacity-10 border border-primary rounded p-3 text-center mb-2">
                     <div className="fw-bold fs-5 mb-2">請拍攝：{AI_GUIDE_SCENE_STEPS[aiGuideStep]}</div>
-                    <label
-                      className="d-block border border-primary rounded p-4 mb-0 bg-white"
-                      style={{ borderStyle: "dashed", cursor: "pointer" }}
+                    <button
+                      type="button"
+                      className="btn btn-outline-primary w-100 py-4"
+                      style={{ borderStyle: "dashed" }}
+                      onClick={() => openCustomCamera("accident_evidence", setAccidentDocuments)}
                     >
                       <div className="fs-1 mb-2">📷</div>
-                      <div className="fw-bold">點此開啟相機拍攝</div>
+                      <div className="fw-bold">點此開啟相機（可拍照或錄影）</div>
                       <div className="small text-muted">可連續拍攝多張，拍好後按下一步</div>
-                      <input
-                        type="file"
-                        accept="image/*"
-                        capture="environment"
-                        multiple
-                        className="d-none"
-                        onChange={handleAiGuideCapture}
-                      />
-                    </label>
+                    </button>
                     {aiGuideStepPhotoCount > 0 && (
                       <div className="small text-success fw-bold mt-2">✅ 這個步驟已拍攝 {aiGuideStepPhotoCount} 張</div>
                     )}
                   </div>
-                  <label className="btn btn-outline-success w-100 mb-2">
+                  <button
+                    type="button"
+                    className="btn btn-outline-success w-100 mb-2"
+                    onClick={() => openCustomCamera("accident_evidence", setAccidentDocuments)}
+                  >
                     📸 即拍即傳（不指定項目，隨時可加拍）
-                    <input
-                      type="file"
-                      accept="image/*"
-                      capture="environment"
-                      multiple
-                      className="d-none"
-                      onChange={handleAiGuideCapture}
-                    />
-                  </label>
+                  </button>
                   <div className="d-flex gap-2">
                     <button type="button" className="btn btn-outline-secondary flex-fill" onClick={aiGuidePrev} disabled={aiGuideStep === 0}>
                       上一步
@@ -2067,11 +2274,7 @@ export default function App() {
               {accidentDocuments.length === 0 ? (
                 <div className="text-muted small">尚無已上傳文件。</div>
               ) : (
-                accidentDocuments.map((d, i) => (
-                  <a key={i} href={d.fileUrl} target="_blank" rel="noopener noreferrer" className="d-block border rounded p-2 mb-2 text-decoration-none">
-                    📎 {d.fileName}
-                  </a>
-                ))
+                accidentDocuments.map(renderDocPreview)
               )}
             </div>
           </div>
@@ -2190,11 +2393,7 @@ export default function App() {
               {repairDocuments.length === 0 ? (
                 <div className="text-muted small">尚無已上傳文件。</div>
               ) : (
-                repairDocuments.map((d, i) => (
-                  <a key={i} href={d.fileUrl} target="_blank" rel="noopener noreferrer" className="d-block border rounded p-2 mb-2 text-decoration-none">
-                    📎 {d.fileName}
-                  </a>
-                ))
+                repairDocuments.map(renderDocPreview)
               )}
             </div>
           </div>
@@ -2439,6 +2638,8 @@ export default function App() {
           </div>
         </div>
       )}
+      {customCameraModal}
     </div>
   );
 }
+
