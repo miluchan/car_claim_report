@@ -692,10 +692,24 @@ export default function App() {
   };
 
   // 3. 統一的文件預覽：圖片直接顯示縮圖、影片可播放，其餘類型才退回下載連結
-  const renderDocPreview = (d, i) => {
+  // 2. 刪除已上傳文件：確認後從資料庫真的刪除（不佔用空間），並從畫面上的清單移除
+  const deleteDocument = async (doc, setList) => {
+    const confirmed = window.confirm(`確定要刪除「${doc.fileName}」嗎？此動作無法復原。`);
+    if (!confirmed) return;
+    if (doc.id) {
+      const { error } = await supabaseClient.from("claim_documents").delete().eq("id", doc.id);
+      if (error) {
+        alert("⚠️ 刪除失敗：" + error.message);
+        return;
+      }
+    }
+    setList((prev) => prev.filter((x) => x.id !== doc.id));
+  };
+
+  const renderDocPreview = (d, i, setList) => {
     const isHeic = d.fileType && /heic|heif/i.test(d.fileType);
     return (
-      <div key={d.id || i} className="border rounded p-2 mb-2">
+      <div key={d.id || i} className="border rounded p-2 mb-2 position-relative">
         {isHeic ? (
           <div className="alert alert-warning small mb-1 py-2">
             ⚠️ 此為iPhone原始HEIC格式照片，瀏覽器可能無法直接預覽，但檔案內容已完整保留，
@@ -710,7 +724,14 @@ export default function App() {
             📎 {d.fileName}
           </a>
         )}
-        <div className="small text-muted">{d.fileName}</div>
+        <div className="d-flex justify-content-between align-items-center">
+          <div className="small text-muted">{d.fileName}</div>
+          {setList && (
+            <button type="button" className="btn btn-sm btn-outline-danger" onClick={() => deleteDocument(d, setList)}>
+              🗑️ 刪除
+            </button>
+          )}
+        </div>
       </div>
     );
   };
@@ -2285,7 +2306,7 @@ export default function App() {
               {accidentDocuments.length > 0 && (
                 <div className="mt-3">
                   <div className="fw-bold small mb-1">已上傳 {accidentDocuments.length} 筆：</div>
-                  {accidentDocuments.map(renderDocPreview)}
+                  {accidentDocuments.map((d, i) => renderDocPreview(d, i, setAccidentDocuments))}
                 </div>
               )}
             </div>
@@ -2305,7 +2326,7 @@ export default function App() {
               {accidentDocuments.length === 0 ? (
                 <div className="text-muted small">尚無已上傳文件。</div>
               ) : (
-                accidentDocuments.map(renderDocPreview)
+                accidentDocuments.map((d, i) => renderDocPreview(d, i, setAccidentDocuments))
               )}
             </div>
           </div>
@@ -2405,7 +2426,7 @@ export default function App() {
               {repairDocuments.length > 0 && (
                 <div className="mt-3">
                   <div className="fw-bold small mb-1">已上傳 {repairDocuments.length} 筆：</div>
-                  {repairDocuments.map(renderDocPreview)}
+                  {repairDocuments.map((d, i) => renderDocPreview(d, i, setRepairDocuments))}
                 </div>
               )}
             </div>
@@ -2425,7 +2446,7 @@ export default function App() {
               {repairDocuments.length === 0 ? (
                 <div className="text-muted small">尚無已上傳文件。</div>
               ) : (
-                repairDocuments.map(renderDocPreview)
+                repairDocuments.map((d, i) => renderDocPreview(d, i, setRepairDocuments))
               )}
             </div>
           </div>
@@ -2674,6 +2695,7 @@ export default function App() {
     </div>
   );
 }
+
 
 
 
